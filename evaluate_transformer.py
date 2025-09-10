@@ -1,88 +1,109 @@
-# evaluate_transformer.py - Transformer evaluation (sample-wise + per-class visualization + dual accuracy)
-
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
-import matplotlib.pyplot as plt
-import pandas as pd
 import os
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+import pandas as pd
+import numpy as np
+import wfdb
+from sklearn.metrics import f1_score, roc_auc_score, hamming_loss
+from sklearn.preprocessing import MultiLabelBinarizer
+from tqdm import tqdm
 
-from src.dataset import PTBXLDataset
-from src.model_cnn_transformer import CNNTransformerECG  # 请确保你 transformer 模型类名为 CNNTransformerECG
+# =========================
+# Dataset
+# =========================
+class PTBXLDataset(Dataset):
+    def __init__(self, data_path, scp_path, base_path, train=False, folds=[1,2,3,4,5]):
+        self.data = pd.read_csv(data_path)
+        self.scp_statements = pd.read_csv(scp_path, index_col=0)
 
-# === 设置路径 ===
-DATA_PATH = "D:/um/7023/brench dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/"
-LABEL_CSV = os.path.join(DATA_PATH, "ptbxl_database.csv")
-MODEL_PATH = "models/transformer_model_71.pth"
-SAVE_CSV = "results/transformer_predictions.csv"
-SAVE_IMG = "results/transformer_f1_per_class.png"
+        self.scp_codes = self.scp_statements[self.scp_statements.diagnostic == 1]
+        self.data['superdiagnostic'] = self.data['scp_codes'].apply(self._aggregate_diagnostic)
 
-def evaluate_model(data_path, label_path, model_path):
-    dataset = PTBXLDataset(data_path, label_path, train=False)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+        if train:
+            self.data = self.data[self.data.strat_fold.isin(folds[:-1])]
+        else:
+            self.data = self.data[self.data.strat_fold == folds[-1]]
 
+        self.base_path = base_path
+        self.mlb = MultiLabelBinarizer(classes=sorted(set([c for l in self.data['superdiagnostic'] for c in l])))
+        self.mlb.fit(self.data['superdiagnostic'])
+
+        print("Classes:", self.mlb.classes_)
+
+    def _aggregate_diagnostic(self, scp_codes_str):
+        scp_codes = eval(scp_codes_str)
+        return [self.scp_statements.loc[k].diagnostic_class for k in scp_codes.keys()
+                if k in self.scp_statements.index and self.scp_statements.loc[k].diagnostic == 1]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        record_path = os.path.join(self.base_path, row.filename_lr)
+        signal, _ = wfdb.rdsamp(record_path)
+        signal = torch.tensor(signal.T, dtype=torch.float)  # [12,1000]
+        label = self.mlb.transform([row.superdiagnostic])[0]
+        return signal, torch.tensor(label, dtype=torch.float)
+
+# =========================
+# Transformer 模型
+# =========================
+class TransformerECG(nn.Module):
+    def __init__(self, num_classes, d_model=128, nhead=4, num_layers=2):
+        super().__init__()
+        self.input_proj = nn.Conv1d(12, d_model, kernel_size=1)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        x = self.input_proj(x)  # [B,128,1000]
+        x = x.permute(0, 2, 1)  # [B,1000,128]
+        x = self.encoder(x)
+        x = x.mean(dim=1)
+        return self.fc(x)
+
+# =========================
+# Eval
+# =========================
+def evaluate(model_path, batch_size=32):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = CNNTransformerECG(num_classes=dataset.num_classes)
-    model.load_state_dict(torch.load(model_path))
-    model.to(device)
+    data_path = "D:/um/7023/brench dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/ptbxl_database.csv"
+    scp_path = "D:/um/7023/brench dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/scp_statements.csv"
+    base_path = "D:/um/7023/brench dataset/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/"
+
+    test_dataset = PTBXLDataset(data_path, scp_path, base_path, train=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+
+    num_classes = len(test_dataset.mlb.classes_)
+    model = TransformerECG(num_classes=num_classes).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
-    y_true, y_pred = [], []
-
+    all_labels, all_preds = [], []
     with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs = inputs.to(device)
-            logits = model(inputs)
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).int().cpu().tolist()
+        for signals, labels in tqdm(test_loader, desc="Evaluating"):
+            signals, labels = signals.to(device), labels.to(device)
+            outputs = model(signals)
+            preds = torch.sigmoid(outputs).cpu().numpy()
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(preds)
 
-            y_pred.extend(preds)
-            y_true.extend(labels.tolist())
+    all_labels = np.vstack(all_labels)
+    all_preds = np.vstack(all_preds)
 
-    df_out = pd.DataFrame(y_pred, columns=[f"Pred_{i}" for i in range(dataset.num_classes)])
-    os.makedirs("results", exist_ok=True)
-    df_out.to_csv(SAVE_CSV, index=False)
-    print(f"\n✅ Predictions saved to {SAVE_CSV}")
+    f1_macro = f1_score(all_labels, all_preds>0.5, average='macro', zero_division=0)
+    f1_micro = f1_score(all_labels, all_preds>0.5, average='micro', zero_division=0)
+    try:
+        auroc = roc_auc_score(all_labels, all_preds, average='macro')
+    except:
+        auroc = float('nan')
+    hloss = hamming_loss(all_labels, all_preds>0.5)
 
-    y_true_tensor = torch.tensor(y_true)
-    y_pred_tensor = torch.tensor(y_pred)
-
-    print("\n📊 Transformer Sample-wise Evaluation Results:")
-    sample_precision = precision_score(y_true_tensor, y_pred_tensor, average='samples', zero_division=0)
-    sample_recall    = recall_score(y_true_tensor, y_pred_tensor, average='samples', zero_division=0)
-    sample_f1        = f1_score(y_true_tensor, y_pred_tensor, average='samples', zero_division=0)
-    strict_accuracy  = (y_true_tensor == y_pred_tensor).all(dim=1).float().mean().item()
-    loose_accuracy   = (y_true_tensor == y_pred_tensor).float().mean().item()
-
-    print(f"Strict Accuracy (Exact Match):   {strict_accuracy:.4f}")
-    print(f"Per-label Accuracy (Avg Match):  {loose_accuracy:.4f}")
-    print(f"Precision (sample-wise):         {sample_precision:.4f}")
-    print(f"Recall (sample-wise):            {sample_recall:.4f}")
-    print(f"F1 Score (sample-wise):          {sample_f1:.4f}")
-
-    print("\n📉 Generating per-class F1-score chart...")
-    report = classification_report(y_true_tensor, y_pred_tensor, output_dict=True, zero_division=0)
-
-    class_f1 = {}
-    for key in report:
-        if key.isdigit():
-            class_f1[key] = report[key]['f1-score']
-
-    class_f1_sorted = dict(sorted(class_f1.items(), key=lambda x: x[1], reverse=True))
-
-    plt.figure(figsize=(18, 6))
-    plt.bar(class_f1_sorted.keys(), class_f1_sorted.values(), color='mediumseagreen')
-    plt.xticks(rotation=90)
-    plt.title("Per-Class F1 Score (Transformer)")
-    plt.xlabel("Label Index")
-    plt.ylabel("F1 Score")
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plt.savefig(SAVE_IMG)
-    print(f"✅ Per-class F1-score 图已保存为 {SAVE_IMG}")
+    print(f"F1-macro: {f1_macro:.4f}, F1-micro: {f1_micro:.4f}, AUROC: {auroc:.4f}, Hamming Loss: {hloss:.4f}")
 
 if __name__ == "__main__":
-    evaluate_model(DATA_PATH, LABEL_CSV, MODEL_PATH)
-
+    evaluate("models/transformer_model_balanced.pth")
